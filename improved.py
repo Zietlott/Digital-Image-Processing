@@ -17,6 +17,7 @@ PIPELINE 2 LUOT (two-pass)
   Luot 2  : doc lai video -> ve box + MSSV len moi frame -> ghi MP4
             (cung kich thuoc, cung FPS, cung he mau BGR voi video goc)
 
+
 """
 import math
 
@@ -73,6 +74,22 @@ MS_Y_MAX = 0.40           # chi phong to dai tren cua frame (ti le chieu cao fra
 MS_X_MIN = 0.25           # va tu 25% chieu rong tro di (khop voi TRACK_X_MIN)
 MS_MAX_R = 14.0           # chi giu ung vien nho (r goc < nguong) tu luot phong to
 
+# ---- [N] Tang phong to x3 cho bien RAT XA. Dung CHINH XAC cac nguong mau / hinh dang
+# / phan loai track cua ban goc => khong them nguy co nhan nham; chi giup track bat dau
+# SOM HON (box xuat hien khi bien con rat nho).
+FAR_ENABLE = True
+FAR_SCALE = 3.0
+FAR_Y_MAX = 0.32
+FAR_X_MIN = 0.30
+FAR_MAX_R = 8.0
+
+# ---- [M] Debug: ve them box VANG manh cho cac track bi LOAI (de thay vat the nao bi
+# loai / bi nhan nham). Video debug duoc ghi ra file "debug_..." rieng. Nop bai: False.
+DEBUG_OVERLAY = False
+
+# ---- [O] Khong bo ung vien lon neu vanh cua no lien mach 1 mau (bien co hoa tiet trong) ----
+BLOB_KEEP_BORDER = 0.65
+
 # ---- Tracker ----
 TRK_MAX_GAP = 20          # [F] so frame toi da duoc mat detection ma track van song
 TRK_GATE_DIST = 0.8       # khoang cach tam toi da (tinh theo kich thuoc box) de ghep
@@ -85,6 +102,7 @@ FRAG_MIN_OBS = 4
 TRACK_MIN_OBS = 15
 TRACK_MIN_DENSITY = 0.40
 TRACK_X_MIN = 0.33        # tam track (trung vi) o phan giua/phai
+TRACK_Y_MIN = 0.20        # bo qua cac bien bao treo qua cao o phia tren (loai tru bien tren gia long mon)
 TRACK_Y_MAX = 0.50        # tam track (trung vi) o nua tren frame
 TRACK_NEAR_CIRC = 0.90    # do tron bao loi luc gan
 TRACK_MIN_SIZE = 18       # duong kinh toi thieu (px) it nhat mot luc trong track
@@ -193,13 +211,15 @@ def iou_min(a, b):
     return inter / float(min(a[2] * a[3], b[2] * b[3]) + 1e-6)
 
 
-def _preprocess(img):
+def _preprocess(img, scale=1.0):
     """
     Tra ve (hsv_goc, hsv_mask).
       hsv_goc  : dung de tinh dac trung (giu nguyen do sang that).
       hsv_mask : kenh V da CLAHE, chi dung de tao mask mau (on dinh voi anh sang yeu/chen).
     """
-    if USE_BILATERAL:
+    if scale >= 3.0:          # anh phong to lon: bilateral qua cham, Gaussian nhe la du
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+    elif USE_BILATERAL:
         img = cv2.bilateralFilter(img, BILATERAL_D, BILATERAL_SC, BILATERAL_SS)
     else:
         img = cv2.GaussianBlur(img, (5, 5), 0)
@@ -220,7 +240,7 @@ def _find_candidates(img, scale=1.0, max_r=None):
     max_r: neu co, chi giu ung vien co ban kinh GOC < max_r.
     """
     ih, iw = img.shape[:2]
-    hsv, hsv_mask = _preprocess(img)
+    hsv, hsv_mask = _preprocess(img, scale)
     red, blue = build_color_masks(hsv_mask)
     k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     k_big = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
@@ -323,6 +343,16 @@ def detect_candidates(frame):
             for c in _find_candidates(up, MS_SCALE, max_r=MS_MAX_R):
                 cands.append(_to_original(c, MS_SCALE, mx, 0))
 
+    # [N] tang x3 cho bien rat xa (cung nguong voi ban goc)
+    if FAR_ENABLE:
+        my3, mx3 = int(fh * FAR_Y_MAX), int(fw * FAR_X_MIN)
+        crop3 = frame[:my3, mx3:]
+        if crop3.size > 0:
+            up3 = cv2.resize(crop3, None, fx=FAR_SCALE, fy=FAR_SCALE,
+                             interpolation=cv2.INTER_CUBIC)
+            for c in _find_candidates(up3, FAR_SCALE, max_r=FAR_MAX_R):
+                cands.append(_to_original(c, FAR_SCALE, mx3, 0))
+
     # Bo khoi dinh: 1 ung vien lon chua >= 2 ung vien nho rieng biet ben trong.
     def _area(c):
         return c["box"][2] * c["box"][3]
@@ -330,7 +360,12 @@ def detect_candidates(frame):
     for i, c in enumerate(cands):
         inside = [o for o in cands if o is not c and _area(o) < 0.7 * _area(c)
                   and iou_min(o["box"], c["box"]) >= 0.8]
-        if any(iou_min(p["box"], q["box"]) < 0.2
+        # [O] Bien co hoa tiet ben trong (vd: bien cam dung/do co gach cheo do chia long
+        # thanh 4 manh xanh roi nhau) KHONG phai khoi dinh: vanh ngoai cua no lien mach
+        # 1 mau (>= BLOB_KEEP_BORDER vanh d=0.7..0.95 cung mau), con khoi dinh that
+        # (2 bien chong len nhau, 2 mau) thi khong dat.
+        coherent = max(c["border_red"], c["border_blue"]) >= BLOB_KEEP_BORDER
+        if not coherent and any(iou_min(p["box"], q["box"]) < 0.2
                for k, p in enumerate(inside) for q in inside[k + 1:]):
             merged_blobs.add(i)
     cands = [c for i, c in enumerate(cands) if i not in merged_blobs]
@@ -394,6 +429,7 @@ class SignTracker:
         self.active = []
         self.finished = []
         self.next_id = 1
+        self.rejected = {}
 
     def _leaving_frame(self, t, frame_idx):
         """Doi tuong da troi ra khoi khung hinh -> ket thuc track."""
@@ -466,8 +502,11 @@ class SignTracker:
         if n < TRACK_MIN_OBS:
             return False
         med = lambda k, ds=dets: float(np.median([d[k] for d in ds]))
-        if med("cx") / fw < TRACK_X_MIN or med("cy") / fh > TRACK_Y_MAX:
+        
+        # Đã cập nhật dòng này: Thêm điều kiện med("cy") / fh < TRACK_Y_MIN
+        if med("cx") / fw < TRACK_X_MIN or med("cy") / fh < TRACK_Y_MIN or med("cy") / fh > TRACK_Y_MAX:
             return False
+            
         if 2 * max(d["r"] for d in dets) < TRACK_MIN_SIZE:
             return False
         if GROWTH_CHECK and not cls._grows_over_time(t.obs):
@@ -614,7 +653,14 @@ class SignTracker:
         self.active, self.finished = [], tracks
 
         frags = [t for t in tracks if self._is_fragment(t)]
-        signs = [t for t in self._merge_fragments(frags) if self._is_traffic_sign(t, fw, fh)]
+        merged = self._merge_fragments(frags)
+        signs = [t for t in merged if self._is_traffic_sign(t, fw, fh)]
+        self.rejected = {}
+        if DEBUG_OVERLAY:
+            for t in merged:
+                if t not in signs and len(t.obs) >= 8:
+                    for f, b in self._dense_boxes(t).items():
+                        self.rejected.setdefault(f, []).append(b)
         for t in signs:
             self._harmonize_ringed(t)
         dense = [(t, self._dense_boxes(t)) for t in signs]
@@ -732,6 +778,8 @@ def process_video(input_path, output_path, ids_text):
     print("  -> %d track bien bao sau hau xu ly" % len(tracker.kept_tracks))
 
     # ---------------- LUOT 2: ve + ghi video ----------------
+    if DEBUG_OVERLAY:
+        output_path = "debug_" + output_path
     cap = cv2.VideoCapture(input_path)
     writer = open_writer(output_path, fps, (fw, fh))
     written = 0
@@ -739,6 +787,9 @@ def process_video(input_path, output_path, ids_text):
         ok, frame = cap.read()
         if not ok:
             break
+        if DEBUG_OVERLAY:
+            for (x, y, w, h) in tracker.rejected.get(written, []):
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
         for (x, y, w, h) in boxes_per_frame.get(written, []):
             cv2.rectangle(frame, (x, y), (x + w, y + h), BOX_COLOR, 2)
         draw_student_ids(frame, ids_text)
